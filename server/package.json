@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "node --env-file=.env --watch-path=./src src/server.ts",
-    "start": "node --env-file=.env --experimental-transform-types src/server.ts",
+    "dev": "node --watch-path=./src src/server.ts",
+    "start": "node --experimental-transform-types src/server.ts",
     "build": "tsc"
   },
   "author": "",
