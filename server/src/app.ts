@@ -25,10 +25,12 @@ app.use(express.urlencoded({ extended: true }));
 app.use("/api/auth", authRoutes);
 app.use("/api/chat", chatRoutes);
 
+
 app.use((_req: Request, res: Response) => {
   res.status(404).json({ success: false, message: "Route not found." });
 });
 
 app.use(errorHandler);
+app.use(cors());
 
 export default app;
