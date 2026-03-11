@@ -8,8 +8,7 @@ import {
 import { MongoDBAtlasVectorSearch } from "@langchain/mongodb";
 import { TextLoader } from "@langchain/classic/document_loaders/fs/text";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
-import { HumanMessage } from "@langchain/core/messages"; 
-// --- MongoDB Native Client (for LangChain vector operations) ---
+
 // ---- __dirname for ESM ----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,14 +22,14 @@ const getMongoClient = async (): Promise<MongoClient> => {
     await mongoClient.connect();
   }
   return mongoClient;
-}; 
+};
 
 // ---- Google GenAI Embeddings ----
-// gemini-embedding-001 → default 3072 dimensions (FREE, same API key as Gemini chat)
 const getEmbeddings = () => {
   if (!process.env.GOOGLE_API_KEY) {
     throw new Error("GOOGLE_API_KEY is not set in .env!");
   }
+
   return new GoogleGenerativeAIEmbeddings({
     apiKey: process.env.GOOGLE_API_KEY,
     model: "gemini-embedding-001",
@@ -50,64 +49,76 @@ const getVectorStore = async () => {
   });
 };
 
-// --- Initialize Knowledge Base ---
+// ============================================
 // A) INDEXING — runs ONCE at server startup
 // ============================================
+
 export const initializeKnowledgeBase = async (): Promise<void> => {
   const client = await getMongoClient();
   const collection = client.db("edureach_db").collection("knowledge_docs");
 
-  // Check if docs exist WITH valid (non-empty) embeddings
+  // Check if embeddings already exist
   const docWithEmbedding = await collection.findOne({
     embedding: { $exists: true, $not: { $size: 0 } },
   });
 
   if (docWithEmbedding) {
     const count = await collection.countDocuments();
-    console.log(` Knowledge base ready (${count} chunks with embeddings)`);
+    console.log(`Knowledge base ready (${count} chunks with embeddings)`);
     return;
   }
 
-  // If docs exist but embeddings are empty → delete and re-index
   const existingCount = await collection.countDocuments();
+
   if (existingCount > 0) {
-    console.log(` Found ${existingCount} chunks with EMPTY embeddings — deleting & re-indexing...`);
+    console.log(`Found ${existingCount} chunks with empty embeddings — reindexing`);
     await collection.deleteMany({});
   }
 
-  console.log(" Indexing knowledge base...");
+  console.log("Indexing knowledge base...");
 
-  // Verify API key FIRST with a test embedding
   const embeddings = getEmbeddings();
+
+  // Test embedding API
   try {
-    const testResult = await embeddings.embedQuery("test");
-    console.log(` API key OK — embedding dimensions: ${testResult.length}`);
+    const test = await embeddings.embedQuery("test");
+    console.log(`Embedding API OK (${test.length} dimensions)`);
   } catch (error: any) {
-    console.error(" Embedding test failed!");
-    console.error("   Error:", error.message || error);
-    console.error("   Get key from: https://aistudio.google.com/apikey");
+    console.error("Embedding test failed:", error.message);
     throw error;
   }
 
-  // LOAD
-  const filePath = path.join(__dirname, "../../knowledge-base/edureach-knowledge.txt");
+  // Load document
+  const filePath = path.join(
+    __dirname,
+    "../../knowledge-base/edureach-knowledge.txt"
+  );
+
   const loader = new TextLoader(filePath);
   const docs = await loader.load();
-  if (docs.length === 0) {
-    throw new Error("No documents found in knowledge base file");
-  }
-  const totalCharacters = docs.reduce((sum, doc) => sum + doc.pageContent.length, 0);
-  console.log(`    Loaded ${totalCharacters} characters`);
 
-  // SPLIT
+  if (docs.length === 0) {
+    throw new Error("Knowledge base file empty");
+  }
+
+  const totalCharacters = docs.reduce(
+    (sum, doc) => sum + doc.pageContent.length,
+    0
+  );
+
+  console.log(`Loaded ${totalCharacters} characters`);
+
+  // Split documents
   const splitter = new RecursiveCharacterTextSplitter({
     chunkSize: 1000,
     chunkOverlap: 200,
   });
-  const allSplits = await splitter.splitDocuments(docs);
-  console.log(`    Split into ${allSplits.length} chunks`);
 
-  // EMBED + STORE
+  const splits = await splitter.splitDocuments(docs);
+
+  console.log(`Split into ${splits.length} chunks`);
+
+  // Store embeddings
   const vectorStore = new MongoDBAtlasVectorSearch(embeddings, {
     collection: collection as any,
     indexName: "edureach_vector_index",
@@ -115,73 +126,78 @@ export const initializeKnowledgeBase = async (): Promise<void> => {
     embeddingKey: "embedding",
   });
 
-  await vectorStore.addDocuments(allSplits);
+  await vectorStore.addDocuments(splits);
 
-  // VERIFY
+  // Verify embeddings
   const verifyDoc = await collection.findOne({
     embedding: { $exists: true, $not: { $size: 0 } },
   });
 
-  if (verifyDoc && Array.isArray(verifyDoc.embedding) && verifyDoc.embedding.length > 0) {
-    console.log(`    ${allSplits.length} chunks stored (${verifyDoc.embedding.length}D embeddings)`);
-    console.log(`     IMPORTANT: Create Atlas Vector Search index with numDimensions: ${verifyDoc.embedding.length}`);
+  if (
+    verifyDoc &&
+    Array.isArray(verifyDoc.embedding) &&
+    verifyDoc.embedding.length > 0
+  ) {
+    console.log(
+      `${splits.length} chunks stored (${verifyDoc.embedding.length}D embeddings)`
+    );
+    console.log(
+      `Create Atlas Vector Index with numDimensions: ${verifyDoc.embedding.length}`
+    );
   } else {
     await collection.deleteMany({});
-    throw new Error(" Embeddings are empty! Google API returned no vectors.");
+    throw new Error("Embeddings generation failed.");
   }
-}; 
+};
 
+// ============================================
+// B) RAG RESPONSE
+// ============================================
 
-// --- Get RAG Response ---
 export const getRAGResponse = async (question: string): Promise<string> => {
   try {
     const vectorStore = await getVectorStore();
 
-    // Retrieve relevant documents from knowledge base
-    const retrievedDocs = await vectorStore.similaritySearch(question, 3);
-    const context = retrievedDocs
-      .map((doc) => doc.pageContent)
-      .join("\n\n");
+    // Retrieve relevant documents
+    const docs = await vectorStore.similaritySearch(question, 3);
 
-    // Create model instance
+    const context = docs.map((doc) => doc.pageContent).join("\n\n");
+
     const model = new ChatGoogleGenerativeAI({
       model: "gemini-2.5-flash-lite",
       temperature: 0.7,
       apiKey: process.env.GOOGLE_API_KEY,
     });
 
-    // Create prompt with context
-    const systemMessage = `You are EduReach Bot, a helpful AI counselor for EduReach College, Hyderabad. 
-Answer questions about the college using the provided information. 
-Be concise, friendly, and professional.
-If the information is not available, say: "I don't have that information right now. Click Talk to Us to speak with a counselor."
+    const systemPrompt = `
+You are EduReach Bot, an AI counselor for EduReach College Hyderabad.
+
+Answer using the knowledge base.
+
+If information is missing say:
+"I don't have that information right now. Click Talk to Us to speak with a counselor."
 
 Knowledge Base:
-${context}`;
+${context}
+`;
 
     const messages = [
-      {
-        role: "system",
-        content: systemMessage,
-      } as any,
-      {
-        role: "user",
-        content: question,
-      } as any,
+      { role: "system", content: systemPrompt },
+      { role: "user", content: question },
     ];
 
-    // Get response from model
-    const result = await model.invoke(messages);
-    
-    // Extract text from response
-    const responseText = typeof result.content === "string" 
-      ? result.content 
-      : (Array.isArray(result.content) ? result.content[0]?.text || "" : "");
+    const result = await model.invoke(messages as any);
 
-    return responseText || "I couldn't generate a response. Please try again.";
+    const response =
+      typeof result.content === "string"
+        ? result.content
+        : Array.isArray(result.content)
+        ? result.content[0]?.text || ""
+        : "";
+
+    return response || "Please try again.";
   } catch (error) {
-    console.error(" RAG Error:", error);
-    return "I'm having trouble right now. Please try again or click 'Talk to Us'.";
+    console.error("RAG Error:", error);
+    return "I'm having trouble right now. Please try again.";
   }
 };
-
